@@ -48,8 +48,15 @@ enum AXContext {
         let value = (copy(element, kAXValueAttribute as CFString) as? String) ?? ""
 
         // Font + color — attempt AX attributed string, fall back to system defaults.
+        // Caret height lets us derive a sensible point size even when the host app
+        // (most notably terminals) refuses to expose font info.
         let bundleId = app.bundleIdentifier ?? ""
-        let (font, color) = styleNearCaret(element, before: selRange.location, bundleId: bundleId)
+        let (font, color) = styleNearCaret(
+            element,
+            before: selRange.location,
+            bundleId: bundleId,
+            caretHeight: caretRect.height
+        )
 
         return CaretContext(
             appName: app.localizedName ?? "?",
@@ -104,7 +111,9 @@ enum AXContext {
     /// Fetch the AX attributed string for the character before the caret, and derive
     /// a Cocoa font + color. Precedence: user config → AX attributed string → built-in
     /// host-appropriate default (monospace for known terminal apps).
-    private static func styleNearCaret(_ el: AXUIElement, before caretLoc: Int, bundleId: String) -> (NSFont, NSColor) {
+    /// `caretHeight` is the pixel height of the caret rect — used to derive a point
+    /// size when AX doesn't hand us one directly.
+    private static func styleNearCaret(_ el: AXUIElement, before caretLoc: Int, bundleId: String, caretHeight: CGFloat) -> (NSFont, NSColor) {
         let fallbackColor = NSColor.labelColor
 
         // 1. Highest priority: explicit user override from config.json.
@@ -112,23 +121,44 @@ enum AXContext {
             return (override, fallbackColor)
         }
 
-        // Built-in per-app default, used when AX is silent.
-        func hostFallbackFont(size: CGFloat) -> NSFont {
-            if let (name, defaultSize) = terminalDefault(bundleId: bundleId) {
-                let s = size > 0 ? size : defaultSize
-                return NSFont(name: name, size: s)
-                    ?? NSFont.monospacedSystemFont(ofSize: s, weight: .regular)
+        // Caret-height → point size. Terminals typically add extra leading on top of
+        // the glyph cell, so the ratio of caret height to point size tends to be
+        // ~1.5 (e.g. Menlo 11pt in iTerm2 reports a ~17pt caret rect). Clamped to a
+        // sane range so a bogus AX reading can't produce a 3pt or 60pt overlay.
+        let derivedSize: CGFloat = {
+            guard caretHeight > 0 else { return 0 }
+            return min(max(caretHeight / 1.5, 9), 32)
+        }()
+
+        // Built-in per-app default, used when AX is silent on the font name.
+        // Prefers the size derived from the caret height over any hardcoded default,
+        // so font size tracks dynamic resizing (e.g. terminal ⌘+/⌘-).
+        func hostFallbackFont(explicitSize: CGFloat) -> NSFont {
+            let size: CGFloat
+            if explicitSize > 0 {
+                size = explicitSize
+            } else if derivedSize > 0 {
+                size = derivedSize
+            } else if let (_, defaultSize) = terminalDefault(bundleId: bundleId) {
+                size = defaultSize
+            } else {
+                size = 14
             }
-            return NSFont.systemFont(ofSize: size > 0 ? size : 14)
+
+            if let (name, _) = terminalDefault(bundleId: bundleId) {
+                return NSFont(name: name, size: size)
+                    ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            }
+            return NSFont.systemFont(ofSize: size)
         }
 
-        guard caretLoc > 0 else { return (hostFallbackFont(size: -1), fallbackColor) }
+        guard caretLoc > 0 else { return (hostFallbackFont(explicitSize: -1), fallbackColor) }
 
         var r = CFRange(location: caretLoc - 1, length: 1)
         guard let param = AXValueCreate(.cfRange, &r),
               let any = copyParam(el, kAXAttributedStringForRangeParameterizedAttribute as CFString, param),
               let attr = any as? NSAttributedString, attr.length > 0 else {
-            return (hostFallbackFont(size: defaultSize), fallbackColor)
+            return (hostFallbackFont(explicitSize: -1), fallbackColor)
         }
 
         let attrs = attr.attributes(at: 0, effectiveRange: nil)
@@ -137,7 +167,7 @@ enum AXContext {
         // Even when AX gives us only a size (e.g. Chromium), use that size with the fallback family.
         var font: NSFont
         if let axFont = attrs[NSAttributedString.Key("AXFont")] as? [String: Any] {
-            let size = (axFont["AXFontSize"] as? Double) ?? defaultSize
+            let size = (axFont["AXFontSize"] as? Double) ?? 14
             if let name = axFont["AXFontName"] as? String, !name.isEmpty,
                let f = NSFont(name: name, size: size) {
                 font = f
@@ -145,12 +175,12 @@ enum AXContext {
                       let f = NSFont(name: family, size: size) {
                 font = f
             } else {
-                font = hostFallbackFont(size: size)
+                font = hostFallbackFont(explicitSize: size)
             }
         } else if let cocoaFont = attrs[.font] as? NSFont {
             font = cocoaFont
         } else {
-            font = hostFallbackFont(size: defaultSize)
+            font = hostFallbackFont(explicitSize: -1)
         }
 
         var color = fallbackColor
@@ -164,19 +194,27 @@ enum AXContext {
         return (font, color)
     }
 
-    /// Bundle IDs of terminal emulators we know use monospace by default.
-    /// When AX doesn't expose a font name for these apps, we fall back to Menlo/SF Mono
-    /// instead of the proportional system font.
-    private static func isTerminal(bundleId: String) -> Bool {
-        let ids: Set<String> = [
-            "com.apple.Terminal",
-            "com.googlecode.iterm2",
-            "com.mitchellh.ghostty",
-            "dev.warp.Warp-Stable",
-            "net.kovidgoyal.kitty",
-            "io.alacritty",
-            "com.github.wez.wezterm",
-        ]
-        return ids.contains(bundleId)
+    /// True if the bundle ID belongs to a terminal emulator we know about.
+    /// Callers use this to relax end-of-text checks, since terminals expose their
+    /// whole visible buffer as one value and we can't tell the user's current input
+    /// apart from TUI chrome below it.
+    static func isTerminalApp(bundleId: String) -> Bool {
+        terminalDefault(bundleId: bundleId) != nil
+    }
+
+    /// Default font + size per terminal, used only when AX doesn't expose a font
+    /// and the user hasn't provided a config override. Match each terminal's
+    /// out-of-box default so it "just works" for anyone on stock settings.
+    private static func terminalDefault(bundleId: String) -> (String, CGFloat)? {
+        switch bundleId {
+        case "com.googlecode.iterm2":   return ("Menlo",   11)
+        case "com.apple.Terminal":      return ("SFMono-Regular", 11)
+        case "com.mitchellh.ghostty":   return ("Menlo",   13)
+        case "dev.warp.Warp-Stable":    return ("Hack",    13)
+        case "net.kovidgoyal.kitty",
+             "io.alacritty",
+             "com.github.wez.wezterm":  return ("Menlo",   12)
+        default:                        return nil
+        }
     }
 }

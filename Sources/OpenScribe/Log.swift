@@ -25,8 +25,11 @@ final class Log {
 
     func line(_ s: String) {
         let stamped = "[\(formatter.string(from: Date()))] \(s)\n"
-        if let data = stamped.data(using: .utf8) {
-            handle.write(data)
-        }
+        guard let data = stamped.data(using: .utf8) else { return }
+        handle.write(data)
+        // Force the OS to flush so we don't lose tail lines on a crash.
+        try? handle.synchronize()
+        // Also to stderr so `make run-fg` shows output live in the terminal.
+        FileHandle.standardError.write(data)
     }
 }
