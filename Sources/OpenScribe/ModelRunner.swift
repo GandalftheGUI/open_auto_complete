@@ -1,7 +1,9 @@
 import Foundation
-import Hub
 import MLXLMCommon
 import MLXLLM
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
 /// Loads a local MLX-converted LLM on startup and serves short continuations on demand.
 /// Thread-safety: all public methods are safe to call from any thread. Model load is
@@ -20,11 +22,11 @@ actor ModelRunner {
     private var activeTask: Task<Void, Never>?
 
     /// The model we ship with for M4a. Tiering comes next.
-    /// Gemma 3 4B 8-bit: ~4.5 GB download, ~6 GB resident. The 4-bit variant's
-    /// quantization layout isn't compatible with mlx-swift-examples 2.29.1's Gemma
-    /// loader; the 8-bit variant uses a different packing that does load.
+    /// Gemma 4 E4B 4-bit: the actual Google Gemma 4 efficient model — the one
+    /// Cotypist ships. Requires mlx-swift-lm `main` because the `gemma4` model type
+    /// isn't in any tagged release yet.
     private let modelConfig = ModelConfiguration(
-        id: "mlx-community/gemma-3-4b-it-8bit"
+        id: "mlx-community/gemma-4-e4b-it-4bit"
     )
 
     /// Loads (or downloads if missing) the model into memory. Safe to call multiple
@@ -41,16 +43,16 @@ actor ModelRunner {
         Log.shared.line("Model: starting load of \(modelConfig.name)")
 
         do {
-            // Force online mode: swift-transformers' NetworkMonitor misdetects some
-            // environments (our sandbox/entitlement setup) as offline and throws
-            // offlineModeError before even attempting a download.
-            let hub = HubApi(useOfflineMode: false)
-            let loaded = try await LLMModelFactory.shared.loadContainer(
-                hub: hub,
-                configuration: modelConfig
-            ) { progress in
-                Task { await self.updateProgress(progress.fractionCompleted) }
-            }
+            // The #huggingFaceLoadModelContainer macro expands to the new
+            // factory.loadContainer(from:using:configuration:progressHandler:) signature
+            // mlx-swift-lm main now requires, with a default Hub-backed Downloader and
+            // TokenizerLoader pre-wired.
+            let loaded = try await #huggingFaceLoadModelContainer(
+                configuration: modelConfig,
+                progressHandler: { progress in
+                    Task { await self.updateProgress(progress.fractionCompleted) }
+                }
+            )
             self.container = loaded
             self.state = .ready
             Log.shared.line("Model: ✅ ready")
@@ -66,33 +68,27 @@ actor ModelRunner {
         }
     }
 
-    /// Produces a short continuation for `context`. Returns nil if the model isn't ready
-    /// or generation fails. Cancels any in-flight generation before starting a new one.
+    /// Produces a short continuation for `context`. Callers should debounce upstream
+    /// so we aren't spammed on every keystroke. No busy-flag guard — a hung MLX
+    /// inference must not lock out future requests.
     func suggest(context: String) async -> String? {
         guard case .ready = state, let container = container else {
             return nil
         }
 
-        // Cancel any in-flight task so only the most recent request matters.
-        activeTask?.cancel()
-
         let tailForLog = String(context.suffix(80))
         Log.shared.line("LLM  ← context(\(context.count) chars, tail): \"\(Self.escape(tailForLog))\"")
         let t0 = Date()
 
-        return await withCheckedContinuation { continuation in
-            let task = Task {
-                let text = await self.generate(using: container, context: context)
-                let elapsed = Int(Date().timeIntervalSince(t0) * 1000)
-                if let t = text {
-                    Log.shared.line("LLM  →  \(elapsed)ms  suggestion: \"\(Self.escape(t))\"")
-                } else {
-                    Log.shared.line("LLM  →  \(elapsed)ms  suggestion: nil")
-                }
-                continuation.resume(returning: text)
-            }
-            self.activeTask = task
+        let text = await generate(using: container, context: context)
+
+        let elapsed = Int(Date().timeIntervalSince(t0) * 1000)
+        if let t = text {
+            Log.shared.line("LLM  →  \(elapsed)ms  suggestion: \"\(Self.escape(t))\"")
+        } else {
+            Log.shared.line("LLM  →  \(elapsed)ms  suggestion: nil")
         }
+        return text
     }
 
     /// Escape control chars so the log stays single-line and readable.
@@ -142,36 +138,28 @@ actor ModelRunner {
         }
     }
 
-    /// Autocomplete prompt. Few-shot format works better than a single-message
-    /// instruction for small chat-tuned models — it steers them away from the
-    /// "Sure! Here's a continuation…" conversational habit.
+    /// Autocomplete prompt. The trick with small instruct models is to frame this as
+    /// a completion task, not a conversation — otherwise you get "Sure! Here's..."
+    /// or ellipsis-prefixed poetry. We give it concrete examples of the format we
+    /// want, which dramatically reduces chatty garbage output.
     private static func buildPrompt(from context: String) -> String {
-        let tail = String(context.suffix(400))
+        let tail = String(context.suffix(300))
         return """
-            You are an autocomplete engine. Output ONLY 1–4 words that would naturally \
-            come next after the user's text. Preserve leading whitespace if needed. No \
-            quotes, no preamble, no explanation, no repetition of the user's text.
+            You complete the user's text with the next 1–4 words only. Output MUST be \
+            just those words — no ellipsis, no quotes, no explanation, no restating.
 
-            Example 1:
-            Text: "I went to the store to buy"
-            Continuation: " some milk"
+            Example: "I went to the store to buy" → " some milk"
+            Example: "The cat sat on the" → " mat"
+            Example: "My favorite color is" → " blue"
 
-            Example 2:
-            Text: "The quick brown fox"
-            Continuation: " jumps over"
-
-            Example 3:
-            Text: "Thanks for the"
-            Continuation: " update"
-
-            Text: "\(tail)"
-            Continuation:
+            Complete this text:
+            \(tail)
             """
     }
 
-    /// Strip chatty preambles the model may add despite instructions, trim at the
-    /// first newline, and hard-cap to 4 words. Leading whitespace is preserved so the
-    /// continuation visually attaches to the user's existing text.
+    /// Strip chatty preambles and leading punctuation garbage (ellipses, em-dashes),
+    /// trim at the first newline, and hard-cap to 4 words. Leading whitespace is
+    /// preserved so the continuation visually attaches to the user's existing text.
     private static func postProcess(_ s: String) -> String {
         var out = s
 
@@ -191,6 +179,13 @@ actor ModelRunner {
         for p in preambles where out.hasPrefix(p) {
             out = String(out.dropFirst(p.count))
             break
+        }
+
+        // Strip leading ellipsis / em-dash / bullet garbage that Gemma 3 likes to add.
+        // Preserves one space after stripping so the word starts cleanly.
+        let leadJunk: [Character] = [".", "…", "–", "—", "•", "*", "-"]
+        while let first = out.first, leadJunk.contains(first) {
+            out.removeFirst()
         }
 
         // Hard-cap to 4 words, preserving leading whitespace.

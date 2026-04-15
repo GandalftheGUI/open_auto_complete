@@ -19,7 +19,9 @@ final class Overlay {
         win.backgroundColor = .clear
         win.hasShadow = false
         win.ignoresMouseEvents = true
-        win.level = .statusBar
+        // Above .popUpMenu (101) so browser URL-suggestion dropdowns and similar
+        // floating lists don't occlude our ghost text.
+        win.level = NSWindow.Level(rawValue: 200)
         win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle,
                                   .fullScreenAuxiliary]
         win.hidesOnDeactivate = false

@@ -18,6 +18,7 @@ build:
 	xcodebuild -scheme $(APP_NAME) -configuration Release \
 		-derivedDataPath $(XCODE_DERIVED) \
 		-destination 'platform=macOS' \
+		-skipMacroValidation \
 		build 2>&1 | grep -E "error:|warning:|ld:|\*\*" | head -40 || true
 
 bundle: build
