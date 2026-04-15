@@ -21,13 +21,11 @@ actor ModelRunner {
     private var container: ModelContainer?
     private var activeTask: Task<Void, Never>?
 
-    /// The model we ship with for M4a. Tiering comes next.
-    /// Gemma 4 E4B 4-bit: the actual Google Gemma 4 efficient model — the one
-    /// Cotypist ships. Requires mlx-swift-lm `main` because the `gemma4` model type
-    /// isn't in any tagged release yet.
-    private let modelConfig = ModelConfiguration(
-        id: "mlx-community/gemma-4-e4b-it-4bit"
-    )
+    /// Resolved from `Settings.shared.modelId` on each load. User can change in the
+    /// settings window; the change takes effect on the next app launch.
+    private var modelConfig: ModelConfiguration {
+        ModelConfiguration(id: Settings.shared.modelId)
+    }
 
     /// Loads (or downloads if missing) the model into memory. Safe to call multiple
     /// times — subsequent calls after the first are no-ops until state resets.

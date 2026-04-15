@@ -149,8 +149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let modMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
             let hasModifiers = !event.flags.intersection(modMask).isEmpty
 
-            // Tab (48): commit just the next word from the current suggestion.
-            if keyCode == 48 && !hasModifiers, let suggestion = currentSuggestion {
+            // Configurable accept key (default Tab = 48) — user-overridable in settings.
+            let acceptKey = Settings.shared.acceptKeyCode
+            if keyCode == acceptKey && !hasModifiers, let suggestion = currentSuggestion {
                 let (chunk, rest) = nextChunk(of: suggestion)
                 Log.shared.line("Tab commit chunk='\(chunk)'  remaining='\(rest)'")
                 typeText(chunk)
@@ -459,16 +460,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.toolTip = "OpenScribe"
         }
         let menu = NSMenu()
+
+        let settingsItem = NSMenuItem(title: "Settings…",
+                                      action: #selector(openSettings),
+                                      keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let openLogItem = NSMenuItem(title: "Open log",
                                      action: #selector(openLog),
                                      keyEquivalent: "l")
         openLogItem.target = self
         menu.addItem(openLogItem)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit OpenScribe",
                                 action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    @objc private func openSettings() {
+        SettingsWindowController.shared.show()
     }
 
     @objc private func openLog() {
