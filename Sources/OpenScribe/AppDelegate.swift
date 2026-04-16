@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mousePressed = false
 
     private let runner = ModelRunner()
+    private let typedBuffer = KeystrokeBuffer()
 
     // Generation counter: each time we actually SEND a request to the model, we bump
     // this and capture the current value. When a response arrives, we check that the
@@ -22,12 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // user is idle (tracker ticks at 30 Hz but context doesn't change).
     private var lastSentContext: String = ""
 
-    // Debounce handle — replaces any pending request when a new one arrives, so bursts
-    // of keystrokes only produce one model call after the user pauses.
+    // Debounce handle — replaces any pending request when a new one arrives. With
+    // mid-decode cancellation at the ModelRunner level (each new request bumps a
+    // monotonic id; older in-flight generations check it between tokens and bail),
+    // we can keep this tiny. Purpose of the debounce is only to collapse same-tick
+    // events like auto-repeat.
     private var pendingSuggestion: DispatchWorkItem?
-    // 80 ms — short enough that most typing rhythms (typical 80-120 ms between keys)
-    // still produce a fire, long enough to collapse auto-repeat spikes.
-    private let debounceDelay: TimeInterval = 0.08
+    private let debounceDelay: TimeInterval = 0.02
 
     // Set whenever a suggestion is currently displayed. Nil means the overlay is
     // hidden. Tab commits `currentSuggestion`; Escape dismisses it.
@@ -92,6 +94,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Kick off model load in the background. UI reflects state via the menu bar.
         Task { await self.runner.loadIfNeeded() }
         startStatusPolling()
+
+        // OCR screen-context: capture on focus change. Best-effort; if Screen
+        // Recording isn't granted we'll simply never have OCR data and fall back to
+        // AX-only behaviour.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(appActivated(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        // Capture for the currently-frontmost app at startup, too.
+        Task { await OCRCache.shared.startCapture() }
+    }
+
+    @objc private func appActivated(_ note: Notification) {
+        typedBuffer.invalidate()  // new app = new field, reseed from AX on next read
+        Task { await OCRCache.shared.startCapture() }
     }
 
     private func startStatusPolling() {
@@ -149,6 +168,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let modMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
             let hasModifiers = !event.flags.intersection(modMask).isEmpty
 
+            // Hybrid buffer maintenance: mirror the host's text field optimistically
+            // so we can build prompt context without waiting for AX to catch up.
+            // Anything we can't cheaply keep in sync (cursor jumps, modifier combos,
+            // keys that aren't literal insertions) invalidates the buffer and we
+            // fall back to AX on the next read.
+            let currentBundle = AXContext.read()?.bundleId ?? ""
+            switch keyCode {
+            case 123, 124, 125, 126,     // arrow keys
+                 115, 119, 116, 121,     // home/end/pgup/pgdn
+                 117:                    // forward-delete
+                typedBuffer.invalidate()
+            case 51:  // backspace
+                if !hasModifiers {
+                    typedBuffer.backspace(for: currentBundle)
+                } else {
+                    typedBuffer.invalidate()  // alt+delete, cmd+delete are word/line ops
+                }
+            default:
+                if hasModifiers {
+                    // Cmd+V paste, Cmd+Z undo, etc — we can't track the effect.
+                    typedBuffer.invalidate()
+                } else if let ch = Self.character(from: event) {
+                    typedBuffer.appendCharacter(ch, for: currentBundle)
+                } else {
+                    Log.shared.line("buffer: character decode failed for keyCode=\(keyCode)")
+                }
+            }
+
             // Configurable accept key (default Tab = 48) — user-overridable in settings.
             let acceptKey = Settings.shared.acceptKeyCode
             if keyCode == acceptKey && !hasModifiers, let suggestion = currentSuggestion {
@@ -175,15 +222,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return false
             }
 
-            // Any other key: reset the current suggestion so the overlay regenerates
-            // from scratch (rather than continuing to show a partially-consumed chunk
-            // that no longer makes sense after new typing).
-            currentSuggestion = nil
+            // Match-advance: if the user types a character that matches the next
+            // character of the current suggestion, trim the suggestion by that
+            // character and keep the overlay visible. This is the 80% case during
+            // a user "following the prediction" run and saves a full model call
+            // per keystroke.
+            let typedChar: Character? = Self.character(from: event)
+            if let existing = currentSuggestion,
+               !existing.isEmpty,
+               !hasModifiers,
+               let first = typedChar,
+               let suggestionFirst = existing.first,
+               first == suggestionFirst {
+                let trimmed = String(existing.dropFirst())
+                Log.shared.line("match-advance: consumed '\(first)', remaining='\(trimmed)'")
+                if trimmed.isEmpty {
+                    dismissOverlay()
+                } else {
+                    currentSuggestion = trimmed
+                    // Re-render on next runloop tick, after host app processes the
+                    // keystroke so AX caret has advanced.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                        self.trackerTick()
+                    }
+                }
+                return true  // don't swallow, let the host app type the char normally
+            }
+
+            // Otherwise: user diverged from the prediction. Reset and ask for a fresh
+            // suggestion based on the new context.
+            if currentSuggestion != nil {
+                Log.shared.line("divergence: typed='\(typedChar.map(String.init) ?? "?")', clearing suggestion and re-firing")
+            }
+            // Hide the visible overlay immediately so the old (now-irrelevant)
+            // suggestion doesn't linger next to the caret while we're asking the
+            // model for a new one.
+            dismissOverlay()
+            hiddenByBackwardNav = false
+            lastSentContext = ""
             DispatchQueue.main.async { self.updateOverlay(logOnMiss: true) }
             return true
 
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             mousePressed = true
+            // Click likely repositions the caret; buffer's "caret at end" invariant
+            // may no longer hold.
+            typedBuffer.invalidate()
             dismissOverlay()
             return true
 
@@ -200,6 +284,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func dismissOverlay() {
         overlay?.hide()
         currentSuggestion = nil
+    }
+
+    /// Decodes the single Unicode character emitted by a CGEvent.keyDown. Returns nil
+    /// for events that don't produce text (arrow keys, F-keys, modifier-only presses).
+    /// Uses a single pre-allocated buffer — the two-call "query length first" pattern
+    /// silently fails for some events because `actualStringLength` isn't reliably
+    /// populated when `unicodeString` is nil.
+    static func character(from event: CGEvent) -> Character? {
+        var length = 0
+        var buffer = [UniChar](repeating: 0, count: 4)
+        event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &buffer)
+        guard length > 0 else { return nil }
+        let s = String(utf16CodeUnits: buffer, count: length)
+        guard s.count == 1 else { return nil }
+        return s.first
     }
 
     /// If `context` ends with a word character (no trailing whitespace) and `suggestion`
@@ -296,7 +395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Reset backward-nav tracking when the focused app changes — a caret offset
-        // from one app is meaningless in another.
+        // from one app is meaningless in another. Also fully reset state, including
+        // clearing the latched `hiddenByBackwardNav` flag, so app switches don't
+        // inherit suppression state from a prior session.
         if ctx.bundleId != prevBundleId {
             prevCaretOffset = -1
             hiddenByBackwardNav = false
@@ -317,6 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prevCaretOffset = ctx.caretOffset
 
         if hiddenByBackwardNav {
+            if logOnMiss { Log.shared.line("skip: hiddenByBackwardNav (prev=\(prevCaretOffset), cur=\(ctx.caretOffset))") }
             dismissOverlay()
             return
         }
@@ -324,23 +426,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Non-terminal end-of-text check: don't render over existing content.
         // Terminals are skipped because AX can't tell their user input apart from
         // TUI chrome (status bars, Claude Code widgets below the prompt).
+        // We tolerate a small gap (≤8 chars) between caret offset and value length
+        // because fast typing frequently outruns AX's internal state update — AX
+        // reports the NEW value but the OLD caret offset briefly.
         let isTerminal = AXContext.isTerminalApp(bundleId: ctx.bundleId)
-        if !isTerminal && ctx.caretOffset < ctx.value.utf16.count {
-            dismissOverlay()
+        let gap = ctx.value.utf16.count - ctx.caretOffset
+        if !isTerminal && gap > 8 {
+            if logOnMiss { Log.shared.line("skip: caret mid-text (offset=\(ctx.caretOffset), len=\(ctx.value.utf16.count))") }
+            // Hide the overlay but don't dismiss pipeline state — the user may just
+            // be typing faster than AX can update its caret offset. Leaving
+            // `currentSuggestion` alone lets a newer in-flight request still land.
+            overlay?.hide()
             return
         }
 
         // (The currentSuggestion early-return lives at the top of this function — we
         // only reach here when currentSuggestion is nil, i.e. we need to fetch fresh.)
 
-        // Build a prompt context from the text before the caret.
-        let head = ctx.value
-        let contextForModel = String(head.suffix(400))
+        // Reconcile our optimistic buffer with AX's ground truth. Buffer wins only
+        // when AX is lagging (we've extended a known prefix); AX wins on any other
+        // discrepancy (paste, autocorrect, something we missed).
+        let caretAtEnd = ctx.caretOffset == ctx.value.utf16.count
+        typedBuffer.reconcile(axValue: ctx.value, axCaretAtEnd: caretAtEnd, bundleId: ctx.bundleId)
+
+        // Build a prompt context from the text before the caret. Prefer our buffer
+        // (instant) over AX's value (can lag by 5-15 ms after a keystroke).
+        let sourceText = typedBuffer.currentValue(for: ctx.bundleId) ?? ctx.value
+        let contextForModel = String(sourceText.suffix(400))
 
         // Skip: too little signal to bother the model with. Covers empty fields,
         // pure-whitespace AX readouts from TUI chrome, and focus on system widgets.
         let meaningful = contextForModel.filter { !$0.isWhitespace }.count
-        guard meaningful >= 10 else { return }
+        guard meaningful >= 10 else {
+            if logOnMiss { Log.shared.line("skip: too little context (meaningful=\(meaningful))") }
+            return
+        }
 
         // Skip TUI chrome. In non-terminal apps, ANY box-drawing char means the AX
         // readout is definitely wrong (real prose never contains ─ or ┌). In
@@ -371,9 +491,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // generation, we'll detect it by comparing this captured value against the
         // freshly-read bundleId at render time.
         let capturedBundleId = ctx.bundleId
+        Log.shared.line("debounce: scheduling for context(\(contextForModel.count) chars)")
         pendingSuggestion?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
+            Log.shared.line("debounce: firing")
             self.fireSuggestion(contextForModel: contextForModel, bundleId: capturedBundleId)
         }
         pendingSuggestion = work
@@ -403,12 +525,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            let suggestion = await self.runner.suggest(context: contextForModel)
+
+            // Optionally augment context with OCR tail when AX text is too short to
+            // be useful (e.g. Reddit nested contenteditable returns minimal value).
+            var promptContext = contextForModel
+            if promptContext.count < 20,
+               let cap = await OCRCache.shared.current(for: sourceBundleId) {
+                let ocrTail = String(cap.joinedText.suffix(500))
+                promptContext = "Nearby text on screen:\n\(ocrTail)\n\nUser is typing:\n\(contextForModel)"
+                Log.shared.line("fire: augmenting short AX context (\(contextForModel.count) chars) with OCR (\(ocrTail.count) chars)")
+            }
+
+            let suggestion = await self.runner.suggest(context: promptContext)
             guard let raw = suggestion, !raw.isEmpty else {
                 await MainActor.run { self.dismissOverlay() }
                 return
             }
             let s = Self.ensureLeadingSpaceIfNeeded(raw, after: contextForModel)
+            let ocrAnchor = await OCRCache.shared.findAnchor(
+                typedTail: String(contextForModel.suffix(40)),
+                for: sourceBundleId,
+                within: AXContext.read()?.fieldFrame
+            )
+
             await MainActor.run {
                 // Only show if a newer request hasn't been sent since we started.
                 guard self.requestGen == myGen else {
@@ -419,31 +558,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     Log.shared.line("overlay skip: AX ctx nil at render time (app=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"))")
                     return
                 }
-                // Focus changed while the model was generating — the suggestion was
-                // produced for the prior app's text and would render nonsensically
-                // in the new app.
                 guard freshCtx.bundleId == sourceBundleId else {
                     Log.shared.line("overlay skip: focus changed during gen (\(sourceBundleId) → \(freshCtx.bundleId))")
                     return
                 }
-                // Sanity-check the caret rect against all attached screens. Chromium
-                // (and some Electron apps) can return a bogus (0, 1890)-style rect
-                // for nested contenteditable fields — rendering there puts the
-                // overlay off-screen or over other content the user isn't looking at.
-                let caretPoint = freshCtx.caretRect.origin
-                let onScreen = NSScreen.screens.contains { screen in
-                    // AX uses top-left origin on primary; convert caretPoint to
-                    // primary-relative cocoa and check each screen's frame.
-                    let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-                    let cocoaY = primaryHeight - caretPoint.y
-                    return screen.frame.contains(CGPoint(x: caretPoint.x, y: cocoaY))
+
+                // Decide effective caret: if AX's caret is clearly bogus (outside
+                // the field) AND OCR found our typed text somewhere on screen,
+                // anchor the overlay at the right edge of that OCR line.
+                let axCaretInsideField = freshCtx.fieldFrame.contains(freshCtx.caretRect.origin)
+                let effectiveCtx: CaretContext
+                if !axCaretInsideField, let anchor = ocrAnchor {
+                    Log.shared.line("overlay: using OCR anchor (AX caret outside field)  anchor=(x=\(Int(anchor.bounds.maxX)),y=\(Int(anchor.bounds.minY)))")
+                    effectiveCtx = CaretContext(
+                        appName: freshCtx.appName,
+                        bundleId: freshCtx.bundleId,
+                        caretRect: CGRect(
+                            x: anchor.bounds.maxX,
+                            y: anchor.bounds.minY,
+                            width: 2,
+                            height: anchor.bounds.height
+                        ),
+                        fieldFrame: freshCtx.fieldFrame,
+                        value: freshCtx.value,
+                        caretOffset: freshCtx.caretOffset,
+                        font: freshCtx.font,
+                        textColor: freshCtx.textColor
+                    )
+                } else {
+                    // Off-screen guard only when we're using AX's caret directly.
+                    let caretPoint = freshCtx.caretRect.origin
+                    let onScreen = NSScreen.screens.contains { screen in
+                        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+                        let cocoaY = primaryHeight - caretPoint.y
+                        return screen.frame.contains(CGPoint(x: caretPoint.x, y: cocoaY))
+                    }
+                    if !onScreen {
+                        Log.shared.line("overlay skip: caret off-screen and no OCR anchor  caret=(\(Int(caretPoint.x)),\(Int(caretPoint.y)))")
+                        return
+                    }
+                    effectiveCtx = freshCtx
                 }
-                if !onScreen {
-                    Log.shared.line("overlay skip: caret off-screen app=\(freshCtx.bundleId) caret=(\(Int(caretPoint.x)),\(Int(caretPoint.y))) fieldFrame=(x=\(Int(freshCtx.fieldFrame.minX)),y=\(Int(freshCtx.fieldFrame.minY)),w=\(Int(freshCtx.fieldFrame.width)),h=\(Int(freshCtx.fieldFrame.height)))")
-                    return
-                }
-                Log.shared.line("overlay show: app=\(freshCtx.bundleId) caret=(\(Int(caretPoint.x)),\(Int(caretPoint.y))) field=(\(Int(freshCtx.fieldFrame.minX)),\(Int(freshCtx.fieldFrame.minY)),\(Int(freshCtx.fieldFrame.width))x\(Int(freshCtx.fieldFrame.height))) suggestion=\"\(s)\"")
-                self.overlay?.show(suggestion: s, in: freshCtx)
+
+                Log.shared.line("overlay show: app=\(effectiveCtx.bundleId) caret=(\(Int(effectiveCtx.caretRect.minX)),\(Int(effectiveCtx.caretRect.minY))) suggestion=\"\(s)\"")
+                self.overlay?.show(suggestion: s, in: effectiveCtx)
                 self.currentSuggestion = s
             }
         }
@@ -473,6 +631,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openLogItem.target = self
         menu.addItem(openLogItem)
 
+        let testOCRItem = NSMenuItem(title: "Test screen OCR",
+                                     action: #selector(testScreenOCR),
+                                     keyEquivalent: "")
+        testOCRItem.target = self
+        menu.addItem(testOCRItem)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit OpenScribe",
                                 action: #selector(NSApplication.terminate(_:)),
@@ -482,6 +646,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    @objc private func testScreenOCR() {
+        guard Permissions.ensureScreenRecording() else {
+            Log.shared.line("OCR test: Screen Recording not granted (toggle in System Settings, then quit + re-run)")
+            return
+        }
+        Log.shared.line("OCR test: starting capture of focused window")
+        Task {
+            guard let cap = await ScreenContext.captureFocusedWindow() else {
+                Log.shared.line("OCR test: capture failed")
+                return
+            }
+            let preview = String(cap.joinedText.prefix(400)).replacingOccurrences(of: "\n", with: "\\n")
+            Log.shared.line("OCR test: \(cap.lines.count) lines  preview \"\(preview)\"")
+        }
     }
 
     @objc private func openLog() {

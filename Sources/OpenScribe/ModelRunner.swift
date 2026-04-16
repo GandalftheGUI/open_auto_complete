@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXLMCommon
 import MLXLLM
 import MLXHuggingFace
@@ -20,6 +21,18 @@ actor ModelRunner {
     private(set) var state: State = .idle
     private var container: ModelContainer?
     private var activeTask: Task<Void, Never>?
+
+    /// Persistent KV cache across model requests. Enables reusing the prefill
+    /// compute for the shared prefix of the previous prompt and the current one.
+    /// When invalidated (cache miss, or prompt diverged), this is discarded.
+    private var persistentCache: [KVCache]?
+    private var cachedTokens: [Int] = []
+
+    /// Monotonic request id. Every `suggest()` call bumps it; mid-flight generations
+    /// check against it between tokens and bail if they've been superseded. This is
+    /// how we achieve "fire on every keystroke, cancel the previous" without needing
+    /// MLX-level cancellation (which doesn't exist for prefill).
+    private var currentRequestId: Int = 0
 
     /// Resolved from `Settings.shared.modelId` on each load. User can change in the
     /// settings window; the change takes effect on the next app launch.
@@ -66,28 +79,34 @@ actor ModelRunner {
         }
     }
 
-    /// Produces a short continuation for `context`. Callers should debounce upstream
-    /// so we aren't spammed on every keystroke. No busy-flag guard — a hung MLX
-    /// inference must not lock out future requests.
+    /// Produces a short continuation for `context`. Each call bumps `currentRequestId`;
+    /// earlier in-flight calls detect this between decoded tokens and bail out early,
+    /// so the newest keystroke always wins without serializing behind stale work.
     func suggest(context: String) async -> String? {
         guard case .ready = state, let container = container else {
             return nil
         }
 
+        currentRequestId += 1
+        let myId = currentRequestId
+
         let tailForLog = String(context.suffix(80))
-        Log.shared.line("LLM  ← context(\(context.count) chars, tail): \"\(Self.escape(tailForLog))\"")
+        Log.shared.line("LLM  ← [#\(myId)] context(\(context.count) chars, tail): \"\(Self.escape(tailForLog))\"")
         let t0 = Date()
 
-        let text = await generate(using: container, context: context)
+        let text = await generate(using: container, context: context, requestId: myId)
 
         let elapsed = Int(Date().timeIntervalSince(t0) * 1000)
         if let t = text {
-            Log.shared.line("LLM  →  \(elapsed)ms  suggestion: \"\(Self.escape(t))\"")
+            Log.shared.line("LLM  →  [#\(myId)] \(elapsed)ms  suggestion: \"\(Self.escape(t))\"")
         } else {
-            Log.shared.line("LLM  →  \(elapsed)ms  suggestion: nil")
+            Log.shared.line("LLM  →  [#\(myId)] \(elapsed)ms  nil (superseded or empty)")
         }
         return text
     }
+
+    /// True iff `id` is still the most recent request.
+    private func isCurrent(_ id: Int) -> Bool { id == currentRequestId }
 
     /// Escape control chars so the log stays single-line and readable.
     private static func escape(_ s: String) -> String {
@@ -96,44 +115,119 @@ actor ModelRunner {
          .replacingOccurrences(of: "\t", with: "\\t")
     }
 
-    private func generate(using container: ModelContainer, context: String) async -> String? {
+    private func generate(using container: ModelContainer, context: String, requestId: Int) async -> String? {
         let prompt = Self.buildPrompt(from: context)
 
         do {
-            let result = try await container.perform { (ctx: ModelContext) -> String in
+            // Capture-by-value into the `container.perform` closure to work around
+            // actor isolation: we read and later write persistent cache state here,
+            // then return the updated cache/tokens for the actor to stash.
+            let priorCache = persistentCache
+            let priorTokens = cachedTokens
+
+            let (rawOutput, newCache, newTokens) = try await container.perform {
+                (ctx: ModelContext) -> (String, [KVCache]?, [Int]) in
+
+                // Tokenize the new prompt using the model's own processor.
                 let input = try await ctx.processor.prepare(input: UserInput(prompt: prompt))
+                let fullTokens: [Int] = input.text.tokens.asArray(Int.self)
 
-                // Temperature 0 → deterministic, best for short completions where we
-                // don't want creative tangents.
-                let parameters = GenerateParameters(temperature: 0, topP: 1.0)
+                // Common prefix between last and current prompts. We only keep shared
+                // cache state if it matches the tokenized prefix exactly.
+                let sharedPrefix = Self.commonPrefixLength(priorTokens, fullTokens)
 
-                var raw = ""
-                let stream = try MLXLMCommon.generate(
-                    input: input,
-                    parameters: parameters,
-                    context: ctx
+                // Decide cache reuse path. If the shared prefix is "meaningful"
+                // (≥16 tokens) and we have a prior cache whose offset matches that
+                // prefix, we trim it and feed only the new tail to the iterator.
+                // Otherwise start fresh.
+                // repetitionPenalty > 1 discourages the model from re-emitting
+                // recently-generated tokens. Without it, greedy decoding (temp=0)
+                // can fall into "memoriesigaigaiga" / "Mexicoгугугу" loops.
+                var parameters = GenerateParameters(temperature: 0, topP: 1.0)
+                parameters.repetitionPenalty = 1.15
+                parameters.repetitionContextSize = 20
+                let cacheToUse: [KVCache]
+                let tailTokens: [Int]
+
+                // Guard: always leave at least one token to feed the TokenIterator.
+                // If the new prompt is a pure prefix/equal to the cached prompt,
+                // shared would equal fullTokens.count and we'd pass an empty tail,
+                // which MLX rejects with a reshape-of-empty-array fatal.
+                let maxShared = max(0, fullTokens.count - 1)
+                let effectiveShared = min(sharedPrefix, maxShared)
+
+                if effectiveShared >= 16,
+                   let prior = priorCache,
+                   let priorOffset = prior.first?.offset,
+                   priorOffset >= effectiveShared {
+                    // Trim each cache layer down to exactly `effectiveShared` entries.
+                    for layer in prior {
+                        layer.trim(priorOffset - effectiveShared)
+                    }
+                    cacheToUse = prior
+                    tailTokens = Array(fullTokens[effectiveShared...])
+                    Log.shared.line("KV reuse: shared=\(effectiveShared) tokens, prefilling only \(tailTokens.count)")
+                } else {
+                    cacheToUse = ctx.model.newCache(parameters: parameters)
+                    tailTokens = fullTokens
+                    Log.shared.line("KV miss: prefilling full prompt (\(fullTokens.count) tokens)")
+                }
+
+                // Build a TokenIterator on the (possibly trimmed) tail and the cache.
+                let tailArray = MLXArray(tailTokens.map { Int32($0) })
+                let lmInput = LMInput(text: .init(tokens: tailArray))
+                var iterator = try TokenIterator(
+                    input: lmInput,
+                    model: ctx.model,
+                    cache: cacheToUse,
+                    parameters: parameters
                 )
 
-                for await item in stream {
-                    if Task.isCancelled { break }
-                    switch item {
-                    case .chunk(let piece):
-                        raw += piece
-                        // Bail early once we clearly have what we need.
-                        if raw.contains("\n") { break }
-                        if Self.wordCount(raw) > 6 { break }
-                        if raw.count > 120 { break }
-                    case .info, .toolCall:
+                // Pull up to 6 tokens or until early-stop conditions. Between tokens
+                // we check if this request has been superseded — bail early if so.
+                var raw = ""
+                var generated = 0
+                while let next = iterator.next() {
+                    if !(await self.isCurrent(requestId)) {
+                        Log.shared.line("gen [#\(requestId)] cancelled mid-decode (superseded)")
                         break
                     }
+                    let piece = ctx.tokenizer.decode(tokenIds: [next], skipSpecialTokens: true)
+                    raw += piece
+                    generated += 1
+                    if raw.contains("\n") { break }
+                    if Self.wordCount(raw) > 6 { break }
+                    if raw.count > 120 { break }
+                    if generated > 24 { break }
+                    if ctx.tokenizer.eosTokenId.map({ $0 == next }) == true { break }
                 }
-                return Self.postProcess(raw)
+
+                // Return updated cache state so the actor can retain it for next time.
+                // The cache now contains the full prompt plus the generated tokens —
+                // reusable for the next request whose prefix matches `fullTokens`.
+                return (Self.postProcess(raw), cacheToUse, fullTokens)
             }
-            return result.isEmpty ? nil : result
+
+            // Persist the cache and the prompt-token-list for the next call.
+            self.persistentCache = newCache
+            self.cachedTokens = newTokens
+            return rawOutput.isEmpty ? nil : rawOutput
         } catch {
             Log.shared.line("Model generate error: \(error)")
+            // Invalidate cache on error so next request starts clean.
+            self.persistentCache = nil
+            self.cachedTokens = []
             return nil
         }
+    }
+
+    /// Length of the longest token sequence that appears at the start of both
+    /// `a` and `b`. Used to decide how much KV cache we can reuse.
+    private static func commonPrefixLength(_ a: [Int], _ b: [Int]) -> Int {
+        let n = min(a.count, b.count)
+        var i = 0
+        while i < n && a[i] == b[i] { i += 1 }
+        return i
     }
 
     /// Autocomplete prompt. The trick with small instruct models is to frame this as
