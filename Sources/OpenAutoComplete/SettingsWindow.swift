@@ -18,7 +18,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "OpenScribe Settings"
+        window.title = "OpenAutoComplete Settings"
         window.center()
         window.isReleasedWhenClosed = false
         self.init(window: window)
@@ -83,7 +83,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         content.addSubview(keyHint)
 
         // --- Restart note ---
-        let note = NSTextField(labelWithString: "Model changes take effect after quitting and relaunching OpenScribe.")
+        let note = NSTextField(labelWithString: "Model changes take effect after quitting and relaunching OpenAutoComplete.")
         note.frame = NSRect(x: 20, y: 30, width: 420, height: 32)
         note.font = NSFont.systemFont(ofSize: 11)
         note.textColor = .tertiaryLabelColor

@@ -1,5 +1,5 @@
-APP_NAME      := OpenScribe
-BUNDLE_ID     := com.opensource.openscribe
+APP_NAME      := OpenAutoComplete
+BUNDLE_ID     := com.opensource.openautocomplete
 BUILD_DIR     := .build/release
 APP_BUNDLE    := $(BUILD_DIR)/$(APP_NAME).app
 PROBE_BIN     := $(BUILD_DIR)/AXProbe
@@ -30,7 +30,7 @@ bundle: build
 	@# metallib lives inside mlx-swift_Cmlx.bundle, and MLXLLM/MLXLMCommon each
 	@# bring their own tokenizer/chat-template bundles.
 	@cp -R "$(XCODE_DERIVED)/Build/Products/Release/"*.bundle "$(APP_BUNDLE)/Contents/Resources/" 2>/dev/null || true
-	@cp Resources/OpenScribe-Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
+	@cp Resources/OpenAutoComplete-Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
 	@codesign --force --deep --sign - --identifier $(BUNDLE_ID) "$(APP_BUNDLE)"
 	@echo "✓ Built $(APP_BUNDLE)"
 
@@ -41,8 +41,8 @@ run: bundle
 	@echo "Grant both in System Settings → Privacy & Security, then re-run 'make run'."
 	@echo ""
 	@open "$(APP_BUNDLE)"
-	@echo "Log file: ~/Library/Logs/OpenScribe/openscribe.log"
-	@echo "Tail it:  tail -f ~/Library/Logs/OpenScribe/openscribe.log"
+	@echo "Log file: ~/Library/Logs/OpenAutoComplete/openautocomplete.log"
+	@echo "Tail it:  tail -f ~/Library/Logs/OpenAutoComplete/openautocomplete.log"
 
 # Foreground run: useful for seeing any crash output / stderr that the bundle swallows.
 run-fg: bundle

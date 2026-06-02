@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "OpenScribe",
+    name: "OpenAutoComplete",
     platforms: [.macOS(.v14)],
     dependencies: [
         // LLM/VLM libraries were split out of mlx-swift-examples into their own repo.
@@ -18,7 +18,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "OpenScribe",
+            name: "OpenAutoComplete",
             dependencies: [
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -26,7 +26,7 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
-            path: "Sources/OpenScribe",
+            path: "Sources/OpenAutoComplete",
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("ApplicationServices"),

@@ -50,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let placeholderSuggestion = "(model loading…)"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Log.shared.line("OpenScribe launched.  exec=\(Bundle.main.executablePath ?? "?")")
+        Log.shared.line("OpenAutoComplete launched.  exec=\(Bundle.main.executablePath ?? "?")")
         Log.shared.line("Logging to: \(Log.shared.path)")
 
         installStatusItem()
@@ -80,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.shared.line("Event tap: ✅ (Input Monitoring granted)")
         } catch {
             Log.shared.line("Event tap: ❌ \(error.localizedDescription)")
-            Log.shared.line("Toggle OpenScribe ON under Privacy & Security → Input Monitoring, then quit and re-run.")
+            Log.shared.line("Toggle OpenAutoComplete ON under Privacy & Security → Input Monitoring, then quit and re-run.")
         }
 
         // ~30 Hz tracker catches window moves, scrolls, and focus changes. It only
@@ -481,11 +481,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if boxDrawCount > 0 { return }
         }
 
-        // Skip self-log pollution: if the user opens openscribe.log in an editor and
+        // Skip self-log pollution: if the user opens openautocomplete.log in an editor and
         // focuses that window, AX feeds our own log lines back as "context" and we
         // end up asking the model to autocomplete its own output — nonsense, and the
         // generated output grows the log, which compounds next tick.
-        let logSignatures = ["LLM  ←", "LLM  →", "Tab commit chunk=", "OpenScribe launched"]
+        let logSignatures = ["LLM  ←", "LLM  →", "Tab commit chunk=", "OpenAutoComplete launched"]
         for sig in logSignatures where contextForModel.contains(sig) {
             return
         }
@@ -620,7 +620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.title = "✎"
-            button.toolTip = "OpenScribe"
+            button.toolTip = "OpenAutoComplete"
         }
         let menu = NSMenu()
 
@@ -643,7 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(testOCRItem)
 
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit OpenScribe",
+        menu.addItem(NSMenuItem(title: "Quit OpenAutoComplete",
                                 action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
         statusItem.menu = menu
@@ -675,11 +675,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showAccessibilityAlertAndQuit() {
         let alert = NSAlert()
-        alert.messageText = "OpenScribe needs Accessibility permission"
+        alert.messageText = "OpenAutoComplete needs Accessibility permission"
         alert.informativeText = """
-            To show suggestions in other apps, OpenScribe needs access to the \
+            To show suggestions in other apps, OpenAutoComplete needs access to the \
             Accessibility API. Grant it in System Settings → Privacy & Security \
-            → Accessibility, then relaunch OpenScribe.
+            → Accessibility, then relaunch OpenAutoComplete.
             """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Open System Settings")

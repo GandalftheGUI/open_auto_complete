@@ -5,7 +5,7 @@ struct FontOverride {
     let size: Double
 }
 
-/// Lightweight user config at ~/.config/openscribe/config.json. Shape:
+/// Lightweight user config at ~/.config/openautocomplete/config.json. Shape:
 /// ```json
 /// {
 ///   "fonts": {
@@ -21,7 +21,7 @@ final class Config {
 
     private init() {
         let path = (NSHomeDirectory() as NSString)
-            .appendingPathComponent(".config/openscribe/config.json")
+            .appendingPathComponent(".config/openautocomplete/config.json")
         self.fontOverrides = Self.load(path: path)
         if !fontOverrides.isEmpty {
             Log.shared.line("Config: loaded \(fontOverrides.count) font override(s) from \(path)")

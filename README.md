@@ -1,4 +1,4 @@
-# OpenScribe
+# OpenAutoComplete
 
 System-wide autocomplete for macOS. Ghost-text suggestions in any text field, powered by a local LLM that runs entirely on your machine.
 
@@ -38,7 +38,7 @@ First launch triggers two permission prompts. Grant both in **System Settings â†
 The app lives in the menu bar. Logs:
 
 ```sh
-tail -f ~/Library/Logs/OpenScribe/openscribe.log
+tail -f ~/Library/Logs/OpenAutoComplete/openautocomplete.log
 ```
 
 Other targets:

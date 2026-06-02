@@ -8,8 +8,8 @@ final class Settings {
     private let defaults = UserDefaults.standard
 
     private enum Keys {
-        static let modelId = "openscribe.model.id"
-        static let acceptKeyCode = "openscribe.acceptkey.code"
+        static let modelId = "openautocomplete.model.id"
+        static let acceptKeyCode = "openautocomplete.acceptkey.code"
     }
 
     /// HuggingFace repo ID of the model to load on launch. Changes take effect after

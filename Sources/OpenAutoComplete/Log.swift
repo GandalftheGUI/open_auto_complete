@@ -8,13 +8,13 @@ final class Log {
     private let formatter: DateFormatter
 
     private init() {
-        // Write to ~/Library/Logs/OpenScribe/openscribe.log — a stable absolute path that
+        // Write to ~/Library/Logs/OpenAutoComplete/openautocomplete.log — a stable absolute path that
         // survives the working-directory changes that happen when launching via `open`.
         let dir = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/Logs/OpenScribe")
+            .appendingPathComponent("Library/Logs/OpenAutoComplete")
         try? FileManager.default.createDirectory(
             atPath: dir, withIntermediateDirectories: true)
-        self.path = (dir as NSString).appendingPathComponent("openscribe.log")
+        self.path = (dir as NSString).appendingPathComponent("openautocomplete.log")
         FileManager.default.createFile(atPath: self.path, contents: nil)
         self.handle = try! FileHandle(forWritingTo: URL(fileURLWithPath: self.path))
 
