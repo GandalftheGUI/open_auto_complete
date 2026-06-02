@@ -301,18 +301,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return s.first
     }
 
-    /// If `context` ends with a word character (no trailing whitespace) and `suggestion`
-    /// also begins with a word character, prepend a space so we don't concatenate words
-    /// on Tab-commit ("another one" + "example" → "another oneexample" without this).
-    static func ensureLeadingSpaceIfNeeded(_ suggestion: String, after context: String) -> String {
-        guard let lastContextChar = context.last,
-              let firstSuggestionChar = suggestion.first else {
-            return suggestion
-        }
-        let lastNeedsSpace = lastContextChar.isLetter || lastContextChar.isNumber
-        let firstNeedsSpace = firstSuggestionChar.isLetter || firstSuggestionChar.isNumber
-        if lastNeedsSpace && firstNeedsSpace {
-            return " " + suggestion
+    /// If the suggestion begins with characters that the user has already typed at
+    /// the tail of `context`, strip that overlap. Fixes subword-token misalignment:
+    /// model sees "ho" and wants to emit "hopes", but its tokenizer splits "hopes"
+    /// as ["h", "opes"], so its generated continuation is "opes" — concatenated
+    /// gives "hoopes". We detect the overlap ("o" is both the last char of context
+    /// and the first char of suggestion) and strip it.
+    static func stripSuffixOverlap(suggestion: String, against context: String) -> String {
+        guard !suggestion.isEmpty, !context.isEmpty else { return suggestion }
+        // Cap the overlap search at 20 chars — overlaps above that aren't realistic
+        // and checking more is wasted work.
+        let maxCheck = min(suggestion.count, context.count, 20)
+        for overlap in stride(from: maxCheck, through: 1, by: -1) {
+            let contextSuffix = context.suffix(overlap)
+            let suggestionPrefix = suggestion.prefix(overlap)
+            if contextSuffix == suggestionPrefix {
+                return String(suggestion.dropFirst(overlap))
+            }
         }
         return suggestion
     }
@@ -541,7 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run { self.dismissOverlay() }
                 return
             }
-            let s = Self.ensureLeadingSpaceIfNeeded(raw, after: contextForModel)
+            let s = Self.stripSuffixOverlap(suggestion: raw, against: contextForModel)
             let ocrAnchor = await OCRCache.shared.findAnchor(
                 typedTail: String(contextForModel.suffix(40)),
                 for: sourceBundleId,

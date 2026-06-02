@@ -116,8 +116,6 @@ actor ModelRunner {
     }
 
     private func generate(using container: ModelContainer, context: String, requestId: Int) async -> String? {
-        let prompt = Self.buildPrompt(from: context)
-
         do {
             // Capture-by-value into the `container.perform` closure to work around
             // actor isolation: we read and later write persistent cache state here,
@@ -128,8 +126,15 @@ actor ModelRunner {
             let (rawOutput, newCache, newTokens) = try await container.perform {
                 (ctx: ModelContext) -> (String, [KVCache]?, [Int]) in
 
-                // Tokenize the new prompt using the model's own processor.
-                let input = try await ctx.processor.prepare(input: UserInput(prompt: prompt))
+                // Feed via chat messages so the processor applies Gemma's chat
+                // template. Without it the model sees the whole prompt as one flat
+                // string and leaks instruction fragments (".ou" from "You...")
+                // back into the completion.
+                let (systemMsg, userMsg) = Self.buildChatPrompt(from: context)
+                let input = try await ctx.processor.prepare(input: UserInput(chat: [
+                    .system(systemMsg),
+                    .user(userMsg),
+                ]))
                 let fullTokens: [Int] = input.text.tokens.asArray(Int.self)
 
                 // Common prefix between last and current prompts. We only keep shared
@@ -196,10 +201,16 @@ actor ModelRunner {
                     raw += piece
                     generated += 1
                     if raw.contains("\n") { break }
-                    if Self.wordCount(raw) > 6 { break }
-                    if raw.count > 120 { break }
-                    if generated > 24 { break }
+                    if Self.wordCount(raw) > 4 { break }
+                    if raw.count > 60 { break }
+                    if generated > 10 { break }
                     if ctx.tokenizer.eosTokenId.map({ $0 == next }) == true { break }
+                    // Stop after sentence-ending punctuation so we don't run past a
+                    // clean completion into hallucination ("liver.bedouit").
+                    let trimmed = raw.trimmingCharacters(in: .whitespaces)
+                    if trimmed.hasSuffix(".") || trimmed.hasSuffix("!") || trimmed.hasSuffix("?") {
+                        break
+                    }
                 }
 
                 // Return updated cache state so the actor can retain it for next time.
@@ -230,23 +241,29 @@ actor ModelRunner {
         return i
     }
 
-    /// Autocomplete prompt. The trick with small instruct models is to frame this as
-    /// a completion task, not a conversation — otherwise you get "Sure! Here's..."
-    /// or ellipsis-prefixed poetry. We give it concrete examples of the format we
-    /// want, which dramatically reduces chatty garbage output.
-    private static func buildPrompt(from context: String) -> String {
+    /// Build a (system, user) pair for Gemma's chat template. System message holds
+    /// the instruction + examples; user message is JUST the text to continue. Keeping
+    /// the text-to-continue in its own role minimizes the chance of the model
+    /// treating instruction text as part of the continuation.
+    private static func buildChatPrompt(from context: String) -> (String, String) {
         let tail = String(context.suffix(300))
-        return """
-            You complete the user's text with the next 1–4 words only. Output MUST be \
-            just those words — no ellipsis, no quotes, no explanation, no restating.
+        let system = """
+            You are an autocomplete engine. Output 1–4 more characters or words that \
+            continue the user's text. Output ONLY the continuation — no quotes, no \
+            explanation, no restating of the user's text.
 
-            Example: "I went to the store to buy" → " some milk"
-            Example: "The cat sat on the" → " mat"
-            Example: "My favorite color is" → " blue"
+            If the text ends mid-word, finish that word first (no leading space).
+            If the text ends at a word boundary, start the next word (with a leading space).
 
-            Complete this text:
-            \(tail)
+            Examples:
+            "I went to the store to buy" → " some milk"
+            "The cat sat on the" → " mat"
+            "I love playing the gui" → "tar"
+            "My favorite color is blu" → "e"
+            "She was tequ" → "ila"
+            "Thanks for the" → " update"
             """
+        return (system, tail)
     }
 
     /// Strip chatty preambles and leading punctuation garbage (ellipses, em-dashes),
