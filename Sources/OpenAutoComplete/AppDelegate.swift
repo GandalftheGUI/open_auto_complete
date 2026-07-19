@@ -168,6 +168,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let modMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
             let hasModifiers = !event.flags.intersection(modMask).isEmpty
 
+            // For buffer tracking and match-advance, Shift alone doesn't make a
+            // keystroke untrackable — `character(from:)` already resolves it to the
+            // correct literal (capital letter, shifted punctuation), so plain Shift
+            // combos are just normal typing. Only Cmd/Ctrl/Alt produce effects we
+            // can't mirror (shortcuts, app-defined bindings), so only those should
+            // invalidate the optimistic buffer or force a divergence re-fire.
+            let untrackableModMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate]
+            let hasUntrackableModifiers = !event.flags.intersection(untrackableModMask).isEmpty
+
             // Hybrid buffer maintenance: mirror the host's text field optimistically
             // so we can build prompt context without waiting for AX to catch up.
             // Anything we can't cheaply keep in sync (cursor jumps, modifier combos,
@@ -180,13 +189,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                  117:                    // forward-delete
                 typedBuffer.invalidate()
             case 51:  // backspace
-                if !hasModifiers {
+                if !hasUntrackableModifiers {
                     typedBuffer.backspace(for: currentBundle)
                 } else {
                     typedBuffer.invalidate()  // alt+delete, cmd+delete are word/line ops
                 }
             default:
-                if hasModifiers {
+                if hasUntrackableModifiers {
                     // Cmd+V paste, Cmd+Z undo, etc — we can't track the effect.
                     typedBuffer.invalidate()
                 } else if let ch = Self.character(from: event) {
@@ -230,7 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let typedChar: Character? = Self.character(from: event)
             if let existing = currentSuggestion,
                !existing.isEmpty,
-               !hasModifiers,
+               !hasUntrackableModifiers,
                let first = typedChar,
                let suggestionFirst = existing.first,
                first == suggestionFirst {
@@ -335,7 +344,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         while i < chars.count && chars[i].isWhitespace { i += 1 }
         if i >= chars.count { return (String(chars), "") }
 
-        let start = i
         let first = chars[i]
         if first.isLetter || first.isNumber {
             while i < chars.count && (chars[i].isLetter || chars[i].isNumber || chars[i] == "'") {
@@ -344,7 +352,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             i += 1  // one punctuation mark
         }
-        _ = start
         let chunk = String(chars[0..<i])
         let rest = String(chars[i...])
         return (chunk, rest)
@@ -610,10 +617,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.currentSuggestion = s
             }
         }
-    }
-
-    private func rectFmt(_ r: CGRect) -> String {
-        "(x=\(Int(r.minX)),y=\(Int(r.minY)),w=\(Int(r.width)),h=\(Int(r.height)))"
     }
 
     private func installStatusItem() {
