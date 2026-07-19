@@ -199,6 +199,17 @@ actor ModelRunner {
                         break
                     }
                     let piece = ctx.tokenizer.decode(tokenIds: [next], skipSpecialTokens: true)
+                    // This chat template's turn-end marker ("<turn|>") isn't
+                    // `tokenizer.eosTokenId` — the model reliably emits it right after a
+                    // clean completion, but since skipSpecialTokens decodes it to "", it
+                    // was invisible to every text-based stop check below, so generation
+                    // ran straight past the model's own stopping point into hallucinated
+                    // continuations ("tar" -> "<turn|>" -> "ouches of my life."). Detect
+                    // any special/control token generically (skipSpecialTokens strips it)
+                    // rather than hardcoding this one marker, since it may differ by model.
+                    if piece != ctx.tokenizer.decode(tokenIds: [next], skipSpecialTokens: false) {
+                        break
+                    }
                     raw += piece
                     generated += 1
                     if raw.contains("\n") { break }
