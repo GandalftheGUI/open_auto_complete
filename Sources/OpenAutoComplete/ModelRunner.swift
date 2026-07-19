@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MLX
 import MLXLMCommon
@@ -216,7 +217,8 @@ actor ModelRunner {
                 // Return updated cache state so the actor can retain it for next time.
                 // The cache now contains the full prompt plus the generated tokens —
                 // reusable for the next request whose prefix matches `fullTokens`.
-                return (Self.postProcess(raw), cacheToUse, fullTokens)
+                let processed = Self.applyWordBoundarySpacing(Self.postProcess(raw), context: context)
+                return (processed, cacheToUse, fullTokens)
             }
 
             // Persist the cache and the prompt-token-list for the next call.
@@ -299,6 +301,32 @@ actor ModelRunner {
 
         // Hard-cap to 4 words, preserving leading whitespace.
         return firstNWords(out, n: 4)
+    }
+
+    /// Inserts a leading space when `suggestion` glues a new word onto `context`
+    /// without one. The system prompt asks the model to omit the leading space only
+    /// when continuing the word already at the caret (e.g. "gui" → "tar") — but in
+    /// practice it drops the space even when starting a genuinely new word about as
+    /// often as not (e.g. "the" → "update", gluing into "theupdate"). A hardcoded
+    /// list of "boundary-only" words caught almost none of these in testing, so
+    /// instead we ask the actual question: does gluing the two trailing/leading
+    /// word-fragments together with no space form a real English word? If so, it's
+    /// a legitimate mid-word completion ("gui"+"tar" = "guitar", a real word) and we
+    /// leave it alone. If not ("the"+"update" = "theupdate", not a word), the model
+    /// meant to start a new word and just forgot the space, so we add it back.
+    private static func applyWordBoundarySpacing(_ suggestion: String, context: String) -> String {
+        guard let lastContextChar = context.last, !lastContextChar.isWhitespace,
+              let firstChar = suggestion.first, !firstChar.isWhitespace else {
+            return suggestion
+        }
+        let contextTailWord = context.reversed().prefix { $0.isLetter }.reversed()
+        let suggestionLeadWord = suggestion.prefix { $0.isLetter }
+        guard !contextTailWord.isEmpty, !suggestionLeadWord.isEmpty else { return suggestion }
+
+        let candidate = String(contextTailWord) + String(suggestionLeadWord)
+        let misspelledRange = NSSpellChecker.shared.checkSpelling(of: candidate, startingAt: 0)
+        let isRealWord = misspelledRange.location == NSNotFound
+        return isRealWord ? suggestion : " " + suggestion
     }
 
     /// Returns up to the first `n` words of `s`, keeping any leading whitespace.
