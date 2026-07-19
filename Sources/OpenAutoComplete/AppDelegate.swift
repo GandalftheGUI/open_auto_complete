@@ -645,6 +645,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         testOCRItem.target = self
         menu.addItem(testOCRItem)
 
+        let sandboxItem = NSMenuItem(title: "Suggestion Sandbox…",
+                                     action: #selector(openSandbox),
+                                     keyEquivalent: "")
+        sandboxItem.target = self
+        menu.addItem(sandboxItem)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit OpenAutoComplete",
                                 action: #selector(NSApplication.terminate(_:)),
@@ -654,6 +660,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    @objc private func openSandbox() {
+        SandboxWindowController.shared.show(runner: runner)
     }
 
     @objc private func testScreenOCR() {
