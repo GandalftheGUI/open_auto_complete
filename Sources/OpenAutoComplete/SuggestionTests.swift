@@ -41,6 +41,12 @@ enum SuggestionTests {
         // Numbers: comma must NOT gain a space when it's a thousands separator.
         Case(name: "number: thousands separator", context: "The price is 3,"),
 
+        // Sentence-ending punctuation must start a genuinely new, capitalized
+        // sentence, not lowercase-continue as if the punctuation weren't there
+        // (reported bug: "I play guitar." kept suggesting " and sing too.").
+        Case(name: "new sentence: reported bug", context: "I play guitar."),
+        Case(name: "new sentence: capitalization", context: "She loves to read."),
+
         // New sentence after a capitalizable word: leading capital is a strong signal.
         Case(name: "new-sentence: capital start", context: "I love it here.  "),
 
@@ -108,8 +114,24 @@ enum SuggestionTests {
         if let f = checkNoLeakedSpecialTokens(s) { failures.append(f) }
         if let f = checkNotSuspiciouslyLong(s) { failures.append(f) }
         if let f = checkSpacingAtBoundary(context: context, suggestion: s) { failures.append(f) }
+        if let f = checkNewSentenceCapitalized(context: context, suggestion: s) { failures.append(f) }
 
         return failures
+    }
+
+    /// A suggestion following sentence-ending punctuation must start a genuinely new,
+    /// capitalized sentence — not lowercase-continue as if the punctuation weren't
+    /// there ("I play guitar." -> " and sing too." was the reported bug this catches).
+    private static func checkNewSentenceCapitalized(context: String, suggestion: String) -> String? {
+        guard let lastMeaningful = context.reversed().first(where: { !$0.isWhitespace }),
+              [".", "!", "?"].contains(lastMeaningful) else {
+            return nil
+        }
+        guard let firstLetter = suggestion.first(where: { $0.isLetter }) else { return nil }
+        if firstLetter.isLowercase {
+            return "new sentence not capitalized after '\(lastMeaningful)'"
+        }
+        return nil
     }
 
     private static func checkNoLeakedSpecialTokens(_ suggestion: String) -> String? {
