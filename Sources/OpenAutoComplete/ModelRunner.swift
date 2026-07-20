@@ -325,11 +325,29 @@ actor ModelRunner {
     /// a legitimate mid-word completion ("gui"+"tar" = "guitar", a real word) and we
     /// leave it alone. If not ("the"+"update" = "theupdate", not a word), the model
     /// meant to start a new word and just forgot the space, so we add it back.
+    /// Clause/sentence punctuation that's essentially always followed by a space in
+    /// prose ("no pizza!I don't like it." should be "no pizza! I don't like it.").
+    /// Unlike the mid-word-vs-new-word case below, there's no real ambiguity here —
+    /// no dictionary check needed, just add the space back.
+    private static let alwaysSpacedAfter: Set<Character> = [".", "!", "?", ";", ":", ","]
+
     private static func applyWordBoundarySpacing(_ suggestion: String, context: String) -> String {
         guard let lastContextChar = context.last, !lastContextChar.isWhitespace,
               let firstChar = suggestion.first, !firstChar.isWhitespace else {
             return suggestion
         }
+
+        if alwaysSpacedAfter.contains(lastContextChar) {
+            // Except thousands-separator commas ("3,000") — flanked by digits on
+            // both sides, that's a number, not clause punctuation.
+            if lastContextChar == ",",
+               let beforeComma = context.dropLast().last, beforeComma.isNumber,
+               firstChar.isNumber {
+                return suggestion
+            }
+            return " " + suggestion
+        }
+
         let contextTailWord = context.reversed().prefix { $0.isLetter }.reversed()
         let suggestionLeadWord = suggestion.prefix { $0.isLetter }
         guard !contextTailWord.isEmpty, !suggestionLeadWord.isEmpty else { return suggestion }
