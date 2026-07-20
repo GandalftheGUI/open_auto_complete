@@ -168,6 +168,16 @@ final class SandboxWindowController: NSWindowController, NSWindowDelegate, NSTex
             let elapsed = Int(Date().timeIntervalSince(t0) * 1000)
             await MainActor.run {
                 guard self.requestGen == myGen else { return }
+                // requestGen alone doesn't catch every race: it only rejects a stale
+                // response once a NEWER request has already started. If the user kept
+                // typing while this one was still generating, the next request may
+                // still be sitting in its debounce delay (hasn't incremented
+                // requestGen yet) when this slower, now-stale response lands. Check
+                // the actual text is unchanged since this request was fired.
+                guard tv.string == text else {
+                    self.statusLabel.stringValue = "(discarded — text changed during generation)"
+                    return
+                }
                 guard let raw = suggestion, !raw.isEmpty else {
                     self.statusLabel.stringValue = "(no suggestion, \(elapsed)ms)"
                     return
@@ -196,15 +206,29 @@ final class SandboxWindowController: NSWindowController, NSWindowDelegate, NSTex
         isApplyingGhost = false
     }
 
+    /// Accepts one Tab-committable chunk at a time (same rule the production overlay
+    /// uses: a word run or a single punctuation mark), not the whole suggestion at
+    /// once — repeated Tabs walk through it, matching real usage.
     private func acceptGhost(_ range: NSRange) {
         guard let tv = textView, let storage = tv.textStorage else { return }
+        let ghostText = (tv.string as NSString).substring(with: range)
+        let (chunk, rest) = AppDelegate.nextChunk(of: ghostText)
+        guard !chunk.isEmpty else { return }
+
         isApplyingGhost = true
-        storage.setAttributes(normalAttrs, range: range)
-        tv.setSelectedRange(NSRange(location: range.location + range.length, length: 0))
+        let chunkRange = NSRange(location: range.location, length: (chunk as NSString).length)
+        storage.setAttributes(normalAttrs, range: chunkRange)
+        let newCaret = range.location + (chunk as NSString).length
+        tv.setSelectedRange(NSRange(location: newCaret, length: 0))
         tv.typingAttributes = normalAttrs
         isApplyingGhost = false
-        ghostRange = nil
-        scheduleSuggestion()
+
+        if rest.isEmpty {
+            ghostRange = nil
+            scheduleSuggestion()
+        } else {
+            ghostRange = NSRange(location: newCaret, length: (rest as NSString).length)
+        }
     }
 
     private func removeGhost(_ range: NSRange) {

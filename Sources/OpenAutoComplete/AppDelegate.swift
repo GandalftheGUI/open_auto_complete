@@ -216,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Configurable accept key (default Tab = 48) — user-overridable in settings.
             let acceptKey = Settings.shared.acceptKeyCode
             if keyCode == acceptKey && !hasModifiers, let suggestion = currentSuggestion {
-                let (chunk, rest) = nextChunk(of: suggestion)
+                let (chunk, rest) = Self.nextChunk(of: suggestion)
                 Log.shared.line("Tab commit chunk='\(chunk)'  remaining='\(rest)'")
                 typeText(chunk)
                 if rest.isEmpty {
@@ -344,7 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// (letters / digits / apostrophes) is one chunk; each punctuation mark is its own
     /// chunk. So `"lazy dog"` → `("lazy", " dog")` → `(" dog", "")`, and `"hi, world"`
     /// → `("hi", ", world")` → `(",", " world")` → `(" world", "")`.
-    func nextChunk(of s: String) -> (chunk: String, rest: String) {
+    static func nextChunk(of s: String) -> (chunk: String, rest: String) {
         let chars = Array(s)
         if chars.isEmpty { return ("", "") }
 
