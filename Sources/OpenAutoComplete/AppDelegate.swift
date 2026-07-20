@@ -55,9 +55,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         installStatusItem()
 
+        // Kick off model load in the background regardless of permissions below —
+        // the Suggestion Sandbox and headless --probe mode only need the model, not
+        // AX/Input Monitoring, so they work even when the system-wide overlay can't.
+        Task { await self.runner.loadIfNeeded() }
+        startStatusPolling()
+
+        // The system-wide overlay (AX reads + event tap) is the only thing that
+        // actually needs Accessibility/Input Monitoring. Every rebuild re-signs the
+        // app with a new ad-hoc signature, which invalidates those TCC grants each
+        // time — quitting here on a missing grant turned every rebuild into a
+        // permission-regrant dance even when only the Sandbox was being used. Now a
+        // missing grant just disables the overlay for this launch; the menu bar,
+        // model, and Sandbox all still work.
         guard Permissions.ensureAccessibility() else {
-            Log.shared.line("Accessibility: ❌ not granted — showing alert and quitting.")
-            showAccessibilityAlertAndQuit()
+            Log.shared.line("Accessibility: ❌ not granted — system-wide overlay disabled for this launch (Sandbox still works). Grant in Privacy & Security → Accessibility to enable it.")
             return
         }
         Log.shared.line("Accessibility: ✅")
@@ -90,10 +102,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.trackerTick()
         }
         if let t = tracker { RunLoop.main.add(t, forMode: .common) }
-
-        // Kick off model load in the background. UI reflects state via the menu bar.
-        Task { await self.runner.loadIfNeeded() }
-        startStatusPolling()
 
         // OCR screen-context: capture on focus change. Best-effort; if Screen
         // Recording isn't granted we'll simply never have OCR data and fall back to
@@ -686,26 +694,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: Log.shared.path))
     }
 
-    private func showAccessibilityAlertAndQuit() {
-        let alert = NSAlert()
-        alert.messageText = "OpenAutoComplete needs Accessibility permission"
-        alert.informativeText = """
-            To show suggestions in other apps, OpenAutoComplete needs access to the \
-            Accessibility API. Grant it in System Settings → Privacy & Security \
-            → Accessibility, then relaunch OpenAutoComplete.
-            """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Quit")
-
-        // LSUIElement apps don't auto-focus; nudge the alert to the front.
-        NSApp.activate(ignoringOtherApps: true)
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-            NSWorkspace.shared.open(url)
-        }
-        NSApp.terminate(nil)
-    }
 }
