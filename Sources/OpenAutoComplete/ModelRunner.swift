@@ -267,6 +267,9 @@ actor ModelRunner {
 
             If the text ends mid-word, finish that word first (no leading space).
             If the text ends at a word boundary, start the next word (with a leading space).
+            If the text ends with sentence-ending punctuation (. ! ?), start a NEW
+            sentence: a leading space, then a capital letter. Never continue the
+            previous sentence as if the punctuation weren't there.
 
             Examples:
             "I went to the store to buy" → " some milk"
@@ -275,6 +278,8 @@ actor ModelRunner {
             "My favorite color is blu" → "e"
             "She was tequ" → "ila"
             "Thanks for the" → " update"
+            "I play guitar." → " I also sing."
+            "That was fun!" → " Let's do it again."
             """
         return (system, tail)
     }
@@ -336,39 +341,57 @@ actor ModelRunner {
     ///    otherwise accepts short fragments that happen to be real words in another
     ///    installed dictionary ("gui" = mistletoe in French, "blu" = blue in Italian).
     private static let alwaysSpacedAfter: Set<Character> = [".", "!", "?", ";", ":", ","]
+    private static let sentenceEnders: Set<Character> = [".", "!", "?"]
 
     private static func applyWordBoundarySpacing(_ suggestion: String, context: String) -> String {
-        guard let lastContextChar = context.last, !lastContextChar.isWhitespace,
-              let firstChar = suggestion.first, !firstChar.isWhitespace else {
-            return suggestion
-        }
+        var result = suggestion
 
-        if alwaysSpacedAfter.contains(lastContextChar) {
-            // Except thousands-separator commas ("3,000") — flanked by digits on
-            // both sides, that's a number, not clause punctuation.
-            if lastContextChar == ",",
-               let beforeComma = context.dropLast().last, beforeComma.isNumber,
-               firstChar.isNumber {
-                return suggestion
+        if let lastContextChar = context.last, !lastContextChar.isWhitespace,
+           let firstChar = result.first, !firstChar.isWhitespace {
+            if alwaysSpacedAfter.contains(lastContextChar) {
+                // Except thousands-separator commas ("3,000") — flanked by digits on
+                // both sides, that's a number, not clause punctuation.
+                let isThousandsSeparator = lastContextChar == ","
+                    && context.dropLast().last?.isNumber == true && firstChar.isNumber
+                if !isThousandsSeparator {
+                    result = " " + result
+                }
+            } else if firstChar.isUppercase {
+                result = " " + result
+            } else {
+                let contextTailWord = context.reversed().prefix { $0.isLetter }.reversed()
+                let suggestionLeadWord = result.prefix { $0.isLetter }
+                if !contextTailWord.isEmpty, !suggestionLeadWord.isEmpty {
+                    let candidate = String(contextTailWord) + String(suggestionLeadWord)
+                    let misspelledRange = NSSpellChecker.shared.checkSpelling(
+                        of: candidate, startingAt: 0, language: "en_US",
+                        wrap: false, inSpellDocumentWithTag: 0, wordCount: nil
+                    )
+                    if misspelledRange.location != NSNotFound {
+                        result = " " + result
+                    }
+                }
             }
-            return " " + suggestion
         }
 
-        if firstChar.isUppercase {
-            return " " + suggestion
+        // Capitalize a new sentence even when the model already added the leading
+        // space itself (so the check above skipped) — e.g. "She loves to read." ->
+        // " books..." should read " Books...". Checked against the last NON-
+        // whitespace char of context, so this still fires correctly through any
+        // trailing spaces the user already typed after the punctuation.
+        if let lastMeaningfulChar = context.reversed().first(where: { !$0.isWhitespace }),
+           sentenceEnders.contains(lastMeaningfulChar) {
+            result = Self.capitalizingFirstLetter(of: result)
         }
 
-        let contextTailWord = context.reversed().prefix { $0.isLetter }.reversed()
-        let suggestionLeadWord = suggestion.prefix { $0.isLetter }
-        guard !contextTailWord.isEmpty, !suggestionLeadWord.isEmpty else { return suggestion }
+        return result
+    }
 
-        let candidate = String(contextTailWord) + String(suggestionLeadWord)
-        let misspelledRange = NSSpellChecker.shared.checkSpelling(
-            of: candidate, startingAt: 0, language: "en_US",
-            wrap: false, inSpellDocumentWithTag: 0, wordCount: nil
-        )
-        let isRealWord = misspelledRange.location == NSNotFound
-        return isRealWord ? suggestion : " " + suggestion
+    private static func capitalizingFirstLetter(of s: String) -> String {
+        guard let idx = s.firstIndex(where: { $0.isLetter }) else { return s }
+        var copy = s
+        copy.replaceSubrange(idx...idx, with: String(copy[idx]).uppercased())
+        return copy
     }
 
     /// Returns up to the first `n` words of `s`, keeping any leading whitespace.
