@@ -318,17 +318,23 @@ actor ModelRunner {
     /// without one. The system prompt asks the model to omit the leading space only
     /// when continuing the word already at the caret (e.g. "gui" → "tar") — but in
     /// practice it drops the space even when starting a genuinely new word about as
-    /// often as not (e.g. "the" → "update", gluing into "theupdate"). A hardcoded
-    /// list of "boundary-only" words caught almost none of these in testing, so
-    /// instead we ask the actual question: does gluing the two trailing/leading
-    /// word-fragments together with no space form a real English word? If so, it's
-    /// a legitimate mid-word completion ("gui"+"tar" = "guitar", a real word) and we
-    /// leave it alone. If not ("the"+"update" = "theupdate", not a word), the model
-    /// meant to start a new word and just forgot the space, so we add it back.
-    /// Clause/sentence punctuation that's essentially always followed by a space in
-    /// prose ("no pizza!I don't like it." should be "no pizza! I don't like it.").
-    /// Unlike the mid-word-vs-new-word case below, there's no real ambiguity here —
-    /// no dictionary check needed, just add the space back.
+    /// often as not (e.g. "the" → "update", gluing into "theupdate"). Three layered
+    /// signals, cheapest/most-certain first:
+    ///
+    /// 1. Clause/sentence punctuation ("no pizza!I don't" → "no pizza! I don't") is
+    ///    essentially always followed by a space in prose — no ambiguity, just fix it.
+    /// 2. A suggestion starting with an uppercase letter ("pizza" + "I" = "pizzaI")
+    ///    is always a new word/sentence — nobody mid-word-completes into a capital
+    ///    letter. This also sidesteps a real NSSpellChecker quirk: it's specifically
+    ///    lenient about strings with an internal capital ("pizzaI" reads as
+    ///    camelCase-ish and isn't flagged misspelled, unlike all-lowercase glues).
+    /// 3. Otherwise, ask the actual question: does gluing the trailing/leading
+    ///    word-fragments together with no space form a real English word? If so,
+    ///    it's a legitimate mid-word completion ("gui"+"tar" = "guitar") and we
+    ///    leave it alone; if not ("the"+"update" = "theupdate"), add the space back.
+    ///    Explicitly pinned to en_US — checkSpelling's default language-autodetection
+    ///    otherwise accepts short fragments that happen to be real words in another
+    ///    installed dictionary ("gui" = mistletoe in French, "blu" = blue in Italian).
     private static let alwaysSpacedAfter: Set<Character> = [".", "!", "?", ";", ":", ","]
 
     private static func applyWordBoundarySpacing(_ suggestion: String, context: String) -> String {
@@ -348,12 +354,19 @@ actor ModelRunner {
             return " " + suggestion
         }
 
+        if firstChar.isUppercase {
+            return " " + suggestion
+        }
+
         let contextTailWord = context.reversed().prefix { $0.isLetter }.reversed()
         let suggestionLeadWord = suggestion.prefix { $0.isLetter }
         guard !contextTailWord.isEmpty, !suggestionLeadWord.isEmpty else { return suggestion }
 
         let candidate = String(contextTailWord) + String(suggestionLeadWord)
-        let misspelledRange = NSSpellChecker.shared.checkSpelling(of: candidate, startingAt: 0)
+        let misspelledRange = NSSpellChecker.shared.checkSpelling(
+            of: candidate, startingAt: 0, language: "en_US",
+            wrap: false, inSpellDocumentWithTag: 0, wordCount: nil
+        )
         let isRealWord = misspelledRange.location == NSNotFound
         return isRealWord ? suggestion : " " + suggestion
     }

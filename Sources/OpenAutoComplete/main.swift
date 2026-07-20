@@ -1,11 +1,15 @@
 import Cocoa
 
-if CommandLine.arguments.contains("--probe") {
+if CommandLine.arguments.contains("--probe") || CommandLine.arguments.contains("--test") {
     // Blocking the main thread on a semaphore here would deadlock: Foundation's
     // networking (used by the Hugging Face downloader) dispatches completions back
     // to the main queue, which only runs if the run loop is actually being pumped.
     Task {
-        await SuggestionProbe.run()
+        if CommandLine.arguments.contains("--test") {
+            await SuggestionTests.run()
+        } else {
+            await SuggestionProbe.run()
+        }
         exit(0)
     }
     RunLoop.main.run()
