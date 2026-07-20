@@ -258,6 +258,21 @@ actor ModelRunner {
     /// the instruction + examples; user message is JUST the text to continue. Keeping
     /// the text-to-continue in its own role minimizes the chance of the model
     /// treating instruction text as part of the continuation.
+    ///
+    /// KNOWN LIMITATION (not fixed, documented so it isn't rediscovered from
+    /// scratch): when context ends one letter short of a real word ("hav" for
+    /// "have"), the model sometimes pattern-matches to the word it thinks is meant
+    /// and jumps straight to what comes after, without emitting the missing
+    /// letter(s) first — e.g. "...I would hav" -> " loved it." instead of the
+    /// correct "e loved it.". Verified in isolation (not a KV-cache artifact) via
+    /// --probe: "...ha" and "...have" both complete correctly, only the "hav"
+    /// near-miss fails. This is a model-reasoning gap, not a formatting bug — there's
+    /// no deterministic fix on the app side, since the app has no way to know what
+    /// letters are actually missing. A dictionary-based "suppress when context's
+    /// trailing fragment isn't a real word but the model treated it as complete
+    /// anyway" heuristic was considered and rejected: it would also suppress valid
+    /// suggestions after slang/abbreviations/names that legitimately aren't in the
+    /// dictionary. Left as-is for now.
     private static func buildChatPrompt(from context: String) -> (String, String) {
         let tail = String(context.suffix(300))
         let system = """
